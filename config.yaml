@@ -1,31 +1,40 @@
-# Edit this file to your sources and preferences.
-# Channel URLs: use the channel's main URL — the script appends /videos.
-# Examples:
-#   https://www.youtube.com/@hubermanlab
-#   https://www.youtube.com/@lexfridman
-#   https://www.youtube.com/c/SomeChannelName
-#   https://www.youtube.com/channel/UCxxxxxxxxxxxxxx
+# yt-clipper config
+#
+# DAY-OF-WEEK ROTATION:
+# The script picks ONE channel per day based on UTC weekday:
+#   Monday    -> channels[0]   (DwarkeshPatel)
+#   Tuesday   -> channels[1]   (matthew_berman)
+#   Wednesday -> channels[2]   (aiexplained-official)
+#   Thursday  -> channels[3]   (LennysPodcast)
+#   Friday    -> channels[4]   (MachineLearningStreetTalk)
+#   Saturday  -> wraps to channels[0]
+#   Sunday    -> wraps to channels[1]
+# It downloads ONE video, makes 3 clips, uploads them, done for the day.
+# This keeps Gemini API and YouTube cookies happy.
 
 channels:
-  - https://www.youtube.com/@REPLACE_ME_1
-  - https://www.youtube.com/@REPLACE_ME_2
-  - https://www.youtube.com/@REPLACE_ME_3
+  - https://www.youtube.com/@DwarkeshPatel
+  - https://www.youtube.com/@matthew_berman
+  - https://www.youtube.com/@aiexplained-official
+  - https://www.youtube.com/@LennysPodcast
+  - https://www.youtube.com/@MachineLearningStreetTalk
 
-# Pick a niche and stick to it. Mixing niches kills the algorithm.
-# Tag your shorts so YouTube knows the topic.
 hashtags:
+  - ai
+  - artificialintelligence
+  - chatgpt
+  - tech
   - podcast
-  - clips
-  - shorts
+  - aiclips
+  - machinelearning
 
-# Quota / safety controls
-max_uploads_per_day: 5         # YT Data API free quota = 10,000/day. ~1,600/upload.
-clips_per_video: 3             # how many clips to attempt per source video
+# Clips from today's one video
+clips_per_video: 3
 
-# Clip length — Shorts must be <=60s. 25-50s tends to perform best.
+# Clip length - Shorts must be <=60s. 25-50s tends to perform best.
 min_clip_seconds: 25
 max_clip_seconds: 58
 
-# Filter out tiny shorts and full-length 3hr movies — pick a sweet spot.
+# Filter out tiny shorts and full-length 3hr movies
 min_source_seconds: 600        # 10 min
 max_source_seconds: 14400      # 4 hr
