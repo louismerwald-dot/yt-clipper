@@ -1,0 +1,7 @@
+yt-dlp>=2026.2.4
+faster-whisper>=1.0.3
+google-genai>=0.8.0
+google-api-python-client>=2.140
+google-auth>=2.30
+google-auth-oauthlib>=1.2
+PyYAML>=6.0
