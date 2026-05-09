@@ -65,14 +65,41 @@ def _ydl_opts(extra: dict | None = None) -> dict:
     opts = {
         "quiet": True,
         "no_warnings": True,
-        "extractor_args": {"youtube": {"player_client": ["tv", "web"]}},
+        # android_vr + tv_simply are the two clients least likely to need PoTokens.
+        # We add web as a fallback. Order matters — yt-dlp tries them in sequence.
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android_vr", "tv_simply", "web_safari"],
+                "player_skip": ["webpage", "configs"],
+            }
+        },
+        # Pretend to be a recent mobile/TV user agent — helps with bot checks.
+        "http_headers": {
+            "User-Agent": (
+                "com.google.android.youtube/19.50.40 (Linux; U; Android 14) "
+                "gzip"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+        # Retry strategies
+        "retries": 5,
+        "fragment_retries": 5,
+        "retry_sleep_functions": {"http": lambda n: min(2 ** n, 30)},
+        # Sleep between requests to look more human
+        "sleep_interval": 2,
+        "max_sleep_interval": 5,
     }
-    cookies = os.environ.get("YT_COOKIES")
+    cookies = (os.environ.get("YT_COOKIES") or "").strip()
     if cookies:
         cookies_path = WORK / "cookies.txt"
         cookies_path.write_text(cookies)
         opts["cookiefile"] = str(cookies_path)
     if extra:
+        # Merge extractor_args properly so caller-passed args don't get clobbered
+        if "extractor_args" in extra:
+            merged = dict(opts["extractor_args"])
+            merged.update(extra["extractor_args"])
+            extra = {**extra, "extractor_args": merged}
         opts.update(extra)
     return opts
 
