@@ -1,26 +1,22 @@
 """
-yt-clipper: Auto-clip the latest video from configured channels into vertical
-shorts with burned-in captions, then upload to your YouTube channel.
+yt-clipper: Auto-clip the latest video from ONE configured channel per day
+(rotating by day of week), into vertical shorts with burned-in captions,
+then upload to your YouTube channel.
 
-Pipeline:
-  1. For each source channel: fetch the latest video (skip if already processed)
-  2. Download with yt-dlp
-  3. Transcribe with faster-whisper (segments + word timestamps)
-  4. Ask Gemini 2.0 Flash to pick the best ~3 viral moments (with hook + reason)
-  5. Cut each moment with FFmpeg, crop to 9:16, burn in styled captions
-  6. Upload to YouTube as a Short (#Shorts in title/description)
-  7. Persist processed-video state so we never double-process
-
-Environment variables required:
-  GEMINI_API_KEY      Google AI Studio key (free tier)
-  YT_CLIENT_ID        OAuth client id for YouTube Data API
-  YT_CLIENT_SECRET    OAuth client secret
-  YT_REFRESH_TOKEN    OAuth refresh token (one-time generated locally)
-  YT_COOKIES          (optional) Netscape-format cookies file contents for yt-dlp
+Day-of-week rotation:
+  - Monday    -> channels[0]
+  - Tuesday   -> channels[1]
+  - Wednesday -> channels[2]
+  - Thursday  -> channels[3]
+  - Friday    -> channels[4]
+  - Saturday  -> channels[5] (if exists, else wraps)
+  - Sunday    -> channels[6] (if exists, else wraps)
+The list wraps modulo len(channels), so 5 channels still works fine.
 """
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 import re
@@ -59,20 +55,66 @@ def load_state() -> dict:
 def save_state(state: dict) -> None:
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
+def channel_for_today(channels: list[str]) -> str:
+    """Pick today's channel based on UTC day-of-week, wrapping."""
+    if not channels:
+        raise ValueError("No channels configured")
+    # weekday(): Monday=0 ... Sunday=6
+    idx = dt.datetime.now(dt.timezone.utc).weekday() % len(channels)
+    return channels[idx]
+
 # ---------- yt-dlp ----------
 
-def _ydl_opts(extra: dict | None = None) -> dict:
+def _ydl_opts(extra: dict | None = None, *, for_listing: bool = False) -> dict:
+    """Build yt-dlp options.
+
+    for_listing=True   -> for fetching a channel's /videos tab (needs web client).
+    for_listing=False  -> for downloading actual video files (android_vr is most
+                          resilient to YouTube's bot detection from datacenter IPs).
+    """
+    if for_listing:
+        client = ["web"]
+        user_agent = (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
+        )
+    else:
+        client = ["android_vr", "tv_simply", "web_safari"]
+        user_agent = (
+            "com.google.android.youtube/19.50.40 (Linux; U; Android 14) gzip"
+        )
+
     opts = {
         "quiet": True,
         "no_warnings": True,
-        "extractor_args": {"youtube": {"player_client": ["tv", "web"]}},
+        "extractor_args": {
+            "youtube": {
+                "player_client": client,
+                "player_skip": ["webpage", "configs"],
+            }
+        },
+        "http_headers": {
+            "User-Agent": user_agent,
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+        "retries": 5,
+        "fragment_retries": 5,
+        "retry_sleep_functions": {"http": lambda n: min(2 ** n, 30)},
+        "sleep_interval": 5,
+        "max_sleep_interval": 15,
     }
-    cookies = os.environ.get("YT_COOKIES")
+    cookies = (os.environ.get("YT_COOKIES") or "").strip()
     if cookies:
+        WORK.mkdir(exist_ok=True)
         cookies_path = WORK / "cookies.txt"
         cookies_path.write_text(cookies)
         opts["cookiefile"] = str(cookies_path)
     if extra:
+        if "extractor_args" in extra:
+            merged = dict(opts["extractor_args"])
+            merged.update(extra["extractor_args"])
+            extra = {**extra, "extractor_args": merged}
         opts.update(extra)
     return opts
 
@@ -81,7 +123,7 @@ def latest_video_for_channel(channel_url: str) -> dict | None:
     feed_url = channel_url.rstrip("/")
     if not feed_url.endswith("/videos"):
         feed_url += "/videos"
-    opts = _ydl_opts({"playlistend": 1, "extract_flat": True})
+    opts = _ydl_opts({"playlistend": 1, "extract_flat": True}, for_listing=True)
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(feed_url, download=False)
     entries = info.get("entries") or []
@@ -99,7 +141,6 @@ def download_video(url: str, out_dir: Path) -> Path:
     out_tmpl = str(out_dir / "%(id)s.%(ext)s")
     opts = _ydl_opts({
         "outtmpl": out_tmpl,
-        # cap quality so the runner disk + time stay reasonable
         "format": "bv*[height<=720][vcodec^=avc1]+ba/b[height<=720]/bv*+ba/b",
         "merge_output_format": "mp4",
     })
@@ -123,8 +164,6 @@ class Segment:
     words: list[Word]
 
 def transcribe(video_path: Path) -> list[Segment]:
-    # 'base' model: fast on CPU, good enough for highlight selection + captions.
-    # Bump to 'small' if you want better quality (~3x slower).
     model = WhisperModel("base", device="cpu", compute_type="int8")
     segments, _info = model.transcribe(
         str(video_path),
@@ -182,7 +221,6 @@ def pick_highlights(
 ) -> list[dict]:
     transcript_lines = [f"{s.start:.1f} | {s.text}" for s in segments]
     transcript = "\n".join(transcript_lines)
-    # Gemini 2.0 Flash free tier handles ~1M tokens but be polite — cap input.
     if len(transcript) > 120_000:
         transcript = transcript[:120_000]
 
@@ -201,7 +239,6 @@ def pick_highlights(
     )
     data = json.loads(resp.text)
     clips = data.get("clips", [])[:n]
-    # sanity-clamp lengths
     out = []
     for c in clips:
         start = max(0.0, float(c["start"]))
@@ -217,7 +254,7 @@ def pick_highlights(
         })
     return out
 
-# ---------- captions (ASS subtitle file, burned in) ----------
+# ---------- captions ----------
 
 def words_in_range(segments: list[Segment], start: float, end: float) -> list[Word]:
     words: list[Word] = []
@@ -241,7 +278,6 @@ def build_caption_file(
     words: list[Word], clip_start: float, out_path: Path,
     chunk_size: int = 3,
 ) -> None:
-    """Bouncy 2-3-word phrase captions, big bold center-bottom."""
     header = """[Script Info]
 ScriptType: v4.00+
 PlayResX: 1080
@@ -263,22 +299,18 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         s = group[0].start - clip_start
         e = group[-1].end - clip_start
         text = " ".join(w.text for w in group).upper()
-        # escape ASS-special chars
         text = text.replace("\\", "\\\\").replace("{", "(").replace("}", ")")
         lines.append(
             f"Dialogue: 0,{_ass_ts(s)},{_ass_ts(e)},Default,,0,0,0,,{text}"
         )
     out_path.write_text("\n".join(lines), encoding="utf-8")
 
-# ---------- ffmpeg cut + crop ----------
+# ---------- ffmpeg ----------
 
 def cut_clip(
     src: Path, dst: Path, start: float, end: float, captions: Path,
 ) -> None:
     duration = end - start
-    # Strategy: seek to start (-ss before -i for fast seek), then re-encode with
-    # crop to 9:16 (centered vertical slice), scale to 1080x1920, burn ASS subs.
-    # Captions filter takes the .ass file.
     vf = (
         f"crop='min(iw,ih*9/16)':'min(ih,iw*16/9)',"
         f"scale=1080:1920:force_original_aspect_ratio=decrease,"
@@ -322,7 +354,7 @@ def upload_short(
             "title": title[:100],
             "description": description[:4500],
             "tags": tags[:15],
-            "categoryId": "24",  # Entertainment; change in config if you like
+            "categoryId": "24",
         },
         "status": {
             "privacyStatus": "public",
@@ -341,10 +373,7 @@ def upload_short(
 def slugify(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")[:40] or "clip"
 
-def process_video(
-    video: dict, segments_cache_dir: Path, cfg: dict, yt,
-) -> int:
-    """Process one source video end-to-end. Returns number of clips uploaded."""
+def process_video(video: dict, cfg: dict, yt) -> int:
     print(f"[+] Processing {video['id']}: {video['title']}")
     video_dir = WORK / video["id"]
     video_dir.mkdir(parents=True, exist_ok=True)
@@ -384,9 +413,8 @@ def process_video(
             uploaded += 1
         except Exception as e:
             print(f"        upload FAILED: {e}", file=sys.stderr)
-            # If quota exceeded, stop trying further uploads today.
             if "quotaExceeded" in str(e):
-                print("    Quota exceeded — stopping uploads for today.")
+                print("    Quota exceeded - stopping uploads for today.")
                 break
     return uploaded
 
@@ -396,48 +424,44 @@ def main() -> int:
     state = load_state()
     processed = set(state["processed_video_ids"])
 
+    channels = cfg["channels"]
+    today_channel = channel_for_today(channels)
+    weekday_name = dt.datetime.now(dt.timezone.utc).strftime("%A")
+    print(f"[i] Today is {weekday_name} (UTC). Today's channel: {today_channel}")
+
+    try:
+        latest = latest_video_for_channel(today_channel)
+    except Exception as e:
+        print(f"[error] couldn't fetch latest from {today_channel}: {e}", file=sys.stderr)
+        return 0
+
+    if not latest:
+        print(f"[-] No videos found for {today_channel}")
+        return 0
+
+    if latest["id"] in processed:
+        print(f"[-] Latest video {latest['id']} already processed. Nothing to do today.")
+        return 0
+
+    if latest["duration"] and latest["duration"] < cfg["min_source_seconds"]:
+        print(f"[-] Latest too short ({latest['duration']}s); skipping.")
+        return 0
+    if latest["duration"] and latest["duration"] > cfg["max_source_seconds"]:
+        print(f"[-] Latest too long ({latest['duration']}s); skipping.")
+        return 0
+
     yt = youtube_client()
-    total_uploaded = 0
-    daily_cap = cfg.get("max_uploads_per_day", 5)
+    try:
+        n = process_video(latest, cfg, yt)
+        processed.add(latest["id"])
+        state["processed_video_ids"] = list(processed)[-500:]
+        save_state(state)
+        print(f"[done] uploaded {n} clip(s)")
+    except Exception as e:
+        print(f"[error] processing {latest['id']}: {e}", file=sys.stderr)
+    finally:
+        shutil.rmtree(WORK / latest["id"], ignore_errors=True)
 
-    for ch in cfg["channels"]:
-        if total_uploaded >= daily_cap:
-            print(f"[stop] hit daily cap of {daily_cap} uploads")
-            break
-        try:
-            latest = latest_video_for_channel(ch)
-        except Exception as e:
-            print(f"[warn] couldn't fetch latest for {ch}: {e}", file=sys.stderr)
-            continue
-        if not latest:
-            continue
-        if latest["id"] in processed:
-            print(f"[-] {ch}: latest {latest['id']} already processed")
-            continue
-        if latest["duration"] and latest["duration"] < cfg["min_source_seconds"]:
-            print(f"[-] {ch}: latest too short ({latest['duration']}s)")
-            continue
-        if latest["duration"] and latest["duration"] > cfg["max_source_seconds"]:
-            print(f"[-] {ch}: latest too long ({latest['duration']}s)")
-            continue
-
-        # cap how many we'll try from this video so we don't blow the daily cap
-        remaining = daily_cap - total_uploaded
-        cfg_for_video = {**cfg, "clips_per_video": min(cfg["clips_per_video"], remaining)}
-        try:
-            n = process_video(latest, WORK, cfg_for_video, yt)
-            total_uploaded += n
-            processed.add(latest["id"])
-            state["processed_video_ids"] = list(processed)[-500:]  # keep recent only
-            save_state(state)
-        except Exception as e:
-            print(f"[error] processing {latest['id']}: {e}", file=sys.stderr)
-            # don't mark as processed — we'll retry next run
-        finally:
-            # tidy up to keep runner disk small
-            shutil.rmtree(WORK / latest["id"], ignore_errors=True)
-
-    print(f"[done] uploaded {total_uploaded} clip(s)")
     return 0
 
 if __name__ == "__main__":
